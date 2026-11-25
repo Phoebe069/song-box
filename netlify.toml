@@ -2,8 +2,8 @@
 # server.js 里已经内联了所有页面，不需要另外的静态目录。
 
 [build]
-  # 只是建一个空目录，满足 Netlify 对"发布目录"的要求
-  command = "mkdir -p public"
+  # 先装依赖（函数要用 @netlify/blobs），再建一个空目录满足"发布目录"的要求
+  command = "npm install --no-audit --no-fund && mkdir -p public"
   publish = "public"
 
 [build.environment]
