@@ -722,7 +722,11 @@ class Store {
 
   /** 存储自检信息：degraded 为 true 说明持久化失败，正在用内存顶着 */
   info() {
-    return { kind: this.kind, degraded: !!(this.driver && this.driver.degraded) };
+    return {
+      kind: this.kind,
+      degraded: !!(this.driver && this.driver.degraded),
+      error: (this.driver && this.driver.lastError) || null,
+    };
   }
 
   update(mutator) {
@@ -755,13 +759,32 @@ class BlobsDriver {
     this.cache = null;
     this.store = null;
     this.degraded = false;
+    this.lastError = null;
   }
 
   async handle() {
     if (this.store) return this.store;
-    const mod = require('@netlify/blobs');
-    this.store = mod.getStore(this.storeName);
-    return this.store;
+    if (this.storePromise) return this.storePromise;
+
+    this.storePromise = (async () => {
+      const mod = require('@netlify/blobs');
+      const getStore =
+        (mod && typeof mod.getStore === 'function' && mod.getStore) ||
+        (mod && mod.default && typeof mod.default.getStore === 'function' && mod.default.getStore);
+      if (!getStore) {
+        throw new Error(`@netlify/blobs 没有导出 getStore（导出了：${Object.keys(mod || {}).join(',') || '空'}）`);
+      }
+      this.store = getStore({ name: this.storeName });
+      return this.store;
+    })();
+
+    return this.storePromise;
+  }
+
+  fail(err) {
+    this.lastError = `${err.name || 'Error'}: ${err.message || err}`;
+    console.warn('[store] Netlify Blobs 不可用：', this.lastError);
+    this.degraded = true;
   }
 
   async load() {
@@ -771,8 +794,7 @@ class BlobsDriver {
       if (!raw) return null;
       return JSON.parse(raw);
     } catch (err) {
-      console.warn('[store] Netlify Blobs 读取失败，改用内存存储：', err.message);
-      this.degraded = true;
+      this.fail(err);
       return this.cache;
     }
   }
@@ -783,8 +805,7 @@ class BlobsDriver {
     try {
       await (await this.handle()).set(STATE_KEY, JSON.stringify(state));
     } catch (err) {
-      console.warn('[store] Netlify Blobs 写入失败，改用内存存储：', err.message);
-      this.degraded = true;
+      this.fail(err);
     }
   }
 }
@@ -1256,6 +1277,7 @@ async function handle(req, res) {
       ok: true,
       store: info.kind,
       degraded: info.degraded,
+      error: info.error,
       items: state.items.length,
       url: publicBaseUrl(req),
       time: Date.now(),
