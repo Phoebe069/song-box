@@ -286,7 +286,41 @@ function isAdmin(req, url) {
 
 // ---------------------------------------------------------------- 静态文件
 
+// 单文件版本会把所有页面塞进这个 map；普通版本走磁盘
+let staticAssets = null;
+
+function setStaticAssets(map) {
+  staticAssets = map;
+}
+
+function cacheControlFor(ext) {
+  return ext === '.css' || ext === '.js' || ext === '.svg' || ext === '.png'
+    ? 'public, max-age=3600'
+    : 'no-cache';
+}
+
+function serveEmbedded(res, pathname) {
+  const rel = pathname === '/' ? '/index.html' : pathname;
+  const candidates = [rel, `${rel}.html`, `${rel.replace(/\/$/, '')}/index.html`];
+  const key = candidates.find((k) => staticAssets[k]);
+  if (!key) {
+    res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end('<!doctype html><meta charset="utf-8"><p>页面不存在，<a href="/">回首页</a></p>');
+    return;
+  }
+  const asset = staticAssets[key];
+  const ext = path.extname(key).toLowerCase();
+  res.writeHead(200, {
+    'Content-Type': asset.type,
+    'Content-Length': Buffer.byteLength(asset.body),
+    'Cache-Control': cacheControlFor(ext),
+  });
+  res.end(asset.body);
+}
+
 function serveStatic(req, res, pathname) {
+  if (staticAssets) return serveEmbedded(res, pathname);
+
   const rel = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
   if (rel.includes('..')) return fail(res, 400, '路径不合法');
 
@@ -304,11 +338,10 @@ function serveStatic(req, res, pathname) {
 
   const stat = fs.statSync(file);
   const ext = path.extname(file).toLowerCase();
-  const longCache = ext === '.css' || ext === '.js' || ext === '.svg' || ext === '.png';
   res.writeHead(200, {
     'Content-Type': MIME[ext] || 'application/octet-stream',
     'Content-Length': stat.size,
-    'Cache-Control': longCache ? 'public, max-age=3600' : 'no-cache',
+    'Cache-Control': cacheControlFor(ext),
   });
   fs.createReadStream(file).pipe(res);
 }
