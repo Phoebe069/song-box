@@ -722,10 +722,13 @@ class Store {
 
   /** 存储自检信息：degraded 为 true 说明持久化失败，正在用内存顶着 */
   info() {
+    const driver = this.driver || {};
     return {
       kind: this.kind,
-      degraded: !!(this.driver && this.driver.degraded),
-      error: (this.driver && this.driver.lastError) || null,
+      degraded: !!driver.degraded,
+      via: driver.via || null,
+      hasContext: !!process.env.NETLIFY_BLOBS_CONTEXT,
+      error: driver.lastError || null,
     };
   }
 
@@ -752,6 +755,67 @@ class Store {
  * 万一运行环境里没有这个模块（或者写失败），就退化成内存存储，
  * 页面照样能用，只是重启后数据会回到起点。
  */
+/**
+ * 不依赖 npm 包，直接调用 Netlify 注入给函数的 Blobs 上下文。
+ * 环境变量 NETLIFY_BLOBS_CONTEXT 是一段 base64 的 JSON，里面有 siteID / token / edgeURL。
+ */
+function readBlobContext() {
+  const raw = process.env.NETLIFY_BLOBS_CONTEXT;
+  if (!raw) return null;
+  try {
+    const json = JSON.parse(Buffer.from(raw, 'base64').toString('utf8'));
+    if (!json || !json.siteID) return null;
+    return {
+      siteID: json.siteID,
+      token: json.token || '',
+      base: json.uncachedEdgeURL || json.edgeURL || '',
+      cacheBase: json.edgeURL || json.uncachedEdgeURL || '',
+    };
+  } catch (err) {
+    return null;
+  }
+}
+
+function makeRestStore(ctx, name) {
+  const keyUrl = (base, key) =>
+    `${String(base).replace(/\/+$/, '')}/${ctx.siteID}/${name}/${encodeURIComponent(key)}`;
+  const headers = () => ({
+    authorization: `Bearer ${ctx.token}`,
+    'content-type': 'application/octet-stream',
+  });
+
+  return {
+    async get(key) {
+      for (const base of [ctx.base, ctx.cacheBase]) {
+        if (!base) continue;
+        const res = await fetch(keyUrl(base, key), { headers: headers() });
+        if (res.status === 404) return null;
+        if (!res.ok) throw new Error(`Blobs 读取失败 ${res.status}`);
+        return await res.text();
+      }
+      throw new Error('Blobs 上下文里没有可用的地址');
+    },
+    async set(key, value) {
+      const bases = [ctx.cacheBase, ctx.base].filter(Boolean);
+      let lastErr = null;
+      for (const base of bases) {
+        try {
+          const res = await fetch(keyUrl(base, key), {
+            method: 'PUT',
+            headers: headers(),
+            body: value,
+          });
+          if (res.ok) return;
+          lastErr = new Error(`Blobs 写入失败 ${res.status}`);
+        } catch (err) {
+          lastErr = err;
+        }
+      }
+      throw lastErr || new Error('Blobs 上下文里没有可用的地址');
+    },
+  };
+}
+
 class BlobsDriver {
   constructor() {
     this.kind = 'blobs';
@@ -760,6 +824,8 @@ class BlobsDriver {
     this.store = null;
     this.degraded = false;
     this.lastError = null;
+    this.via = null;
+    this.moduleError = null;
   }
 
   async handle() {
@@ -767,15 +833,33 @@ class BlobsDriver {
     if (this.storePromise) return this.storePromise;
 
     this.storePromise = (async () => {
-      const mod = require('@netlify/blobs');
-      const getStore =
-        (mod && typeof mod.getStore === 'function' && mod.getStore) ||
-        (mod && mod.default && typeof mod.default.getStore === 'function' && mod.default.getStore);
-      if (!getStore) {
-        throw new Error(`@netlify/blobs 没有导出 getStore（导出了：${Object.keys(mod || {}).join(',') || '空'}）`);
+      // 方式一：官方模块（Netlify 函数环境里通常有）
+      try {
+        const mod = require('@netlify/blobs');
+        const getStore =
+          (mod && typeof mod.getStore === 'function' && mod.getStore) ||
+          (mod && mod.default && typeof mod.default.getStore === 'function' && mod.default.getStore);
+        if (getStore) {
+          this.store = getStore({ name: this.storeName });
+          this.via = 'module';
+          return this.store;
+        }
+        this.moduleError = '模块没导出 getStore';
+      } catch (err) {
+        this.moduleError = err.message;
       }
-      this.store = getStore({ name: this.storeName });
-      return this.store;
+
+      // 方式二：自己拿注入的凭证直接发请求
+      const ctx = readBlobContext();
+      if (ctx && (ctx.base || ctx.cacheBase)) {
+        this.store = makeRestStore(ctx, this.storeName);
+        this.via = 'context';
+        return this.store;
+      }
+
+      throw new Error(
+        `没有可用的 Blobs 通道（模块：${this.moduleError || '无'}；上下文：${ctx ? '有但缺地址' : '缺失'}）`
+      );
     })();
 
     return this.storePromise;
@@ -1277,6 +1361,8 @@ async function handle(req, res) {
       ok: true,
       store: info.kind,
       degraded: info.degraded,
+      via: info.via,
+      hasContext: info.hasContext,
       error: info.error,
       items: state.items.length,
       url: publicBaseUrl(req),
