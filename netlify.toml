@@ -1,0 +1,19 @@
+# Netlify 部署配置：一个函数接管全站请求
+# server.js 里已经内联了所有页面，不需要另外的静态目录。
+
+[build]
+  # 只是建一个空目录，满足 Netlify 对"发布目录"的要求
+  command = "mkdir -p public"
+  publish = "public"
+
+[build.environment]
+  # 用 Netlify 自带的 Blobs 存储（不用另外注册数据库）
+  STORE_DRIVER = "blobs"
+
+[functions]
+  directory = "netlify/functions"
+
+[[redirects]]
+  from = "/*"
+  to = "/.netlify/functions/app"
+  status = 200

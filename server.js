@@ -683,7 +683,7 @@ class UpstashDriver {
 class Store {
   /**
    * @param {object} driver 具备 load()/save() 的对象
-   * @param {number} ttlMs  内存缓存时长（单实例部署时缓存不会读到旧数据）
+   * @param {number} ttlMs  内存缓存时长（单实例部署时会自动失效，不会读到旧数据）
    */
   constructor(driver, ttlMs = 0) {
     this.driver = driver;
@@ -720,12 +720,61 @@ class Store {
   }
 }
 
+/**
+ * Netlify Blobs：Netlify 自带的键值存储，不用另外注册账号。
+ * 万一运行环境里没有这个模块（或者写失败），就退化成内存存储，
+ * 页面照样能用，只是重启后数据会回到起点。
+ */
+class BlobsDriver {
+  constructor() {
+    this.storeName = 'songbox';
+    this.cache = null;
+    this.store = null;
+    this.degraded = false;
+  }
+
+  async handle() {
+    if (this.store) return this.store;
+    const mod = require('@netlify/blobs');
+    this.store = mod.getStore(this.storeName);
+    return this.store;
+  }
+
+  async load() {
+    if (this.degraded) return this.cache;
+    try {
+      const raw = await (await this.handle()).get(STATE_KEY);
+      if (!raw) return null;
+      return JSON.parse(raw);
+    } catch (err) {
+      console.warn('[store] Netlify Blobs 读取失败，改用内存存储：', err.message);
+      this.degraded = true;
+      return this.cache;
+    }
+  }
+
+  async save(state) {
+    this.cache = state;
+    if (this.degraded) return;
+    try {
+      await (await this.handle()).set(STATE_KEY, JSON.stringify(state));
+    } catch (err) {
+      console.warn('[store] Netlify Blobs 写入失败，改用内存存储：', err.message);
+      this.degraded = true;
+    }
+  }
+}
+
 function createStore() {
   const upstashUrl = process.env.UPSTASH_REDIS_REST_URL;
   const upstashToken = process.env.UPSTASH_REDIS_REST_TOKEN;
   if (upstashUrl && upstashToken) {
     console.log('[store] 使用 Upstash Redis 云端存储');
     return new Store(new UpstashDriver(upstashUrl, upstashToken), Number(process.env.STATE_CACHE_MS || 20000));
+  }
+  if (process.env.STORE_DRIVER === 'blobs') {
+    console.log('[store] 使用 Netlify Blobs 存储');
+    return new Store(new BlobsDriver(), 0);
   }
   const dir = process.env.DATA_DIR || path.join(__dirname, '..', 'data');
   console.log(`[store] 使用本地文件存储：${dir}`);
@@ -1371,3 +1420,58 @@ module.exports = { start, server };
 
 process.on('SIGTERM', () => server.close(() => process.exit(0)));
 process.on('SIGINT', () => server.close(() => process.exit(0)));
+
+
+// ---------------------------------------------------------------- Netlify / 无服务器适配层
+// Netlify 的 Functions 不给 Node 的 http 服务器，而是给 event 对象。
+// 这里把它包成 req/res，直接复用同一个 handle 函数，逻辑一行都不用改。
+const { Readable } = require('node:stream');
+
+async function netlifyHandler(event) {
+  const headers = {};
+  for (const [key, value] of Object.entries(event.headers || {})) {
+    headers[String(key).toLowerCase()] = value;
+  }
+
+  const rawUrl = event.rawUrl || ('https://' + (headers.host || 'localhost') + (event.path || '/'));
+  const parsed = new URL(rawUrl);
+
+  let body = Buffer.alloc(0);
+  if (event.body) {
+    body = event.isBase64Encoded ? Buffer.from(event.body, 'base64') : Buffer.from(event.body, 'utf8');
+  }
+
+  const req = Readable.from(body.length ? [body] : []);
+  req.method = event.httpMethod || 'GET';
+  req.url = parsed.pathname + (parsed.search || '');
+  req.headers = headers;
+  req.socket = {
+    remoteAddress: String(headers['x-forwarded-for'] || '').split(',')[0].trim() || 'unknown',
+    encrypted: true,
+  };
+
+  const res = { statusCode: 200, headers: {}, chunks: [] };
+  res.setHeader = (key, value) => {
+    res.headers[key] = String(value);
+  };
+  res.writeHead = (code, extra) => {
+    res.statusCode = code;
+    if (extra) for (const [key, value] of Object.entries(extra)) res.headers[key] = String(value);
+    return res;
+  };
+  res.end = (chunk) => {
+    if (chunk) res.chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
+  };
+  res.on = () => res;
+  res.removeHeader = () => {};
+
+  await handle(req, res);
+  return {
+    statusCode: res.statusCode,
+    headers: res.headers,
+    body: Buffer.concat(res.chunks).toString('utf8'),
+  };
+}
+
+module.exports.handle = handle;
+module.exports.handler = netlifyHandler;
