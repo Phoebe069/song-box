@@ -765,6 +765,16 @@ class BlobsDriver {
   }
 }
 
+/** 装了 @netlify/blobs 就说明运行在 Netlify 函数环境里（本地开发没有这个包） */
+function hasNetlifyBlobs() {
+  try {
+    require.resolve('@netlify/blobs');
+    return true;
+  } catch (err) {
+    return false;
+  }
+}
+
 function createStore() {
   const upstashUrl = process.env.UPSTASH_REDIS_REST_URL;
   const upstashToken = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -772,7 +782,9 @@ function createStore() {
     console.log('[store] 使用 Upstash Redis 云端存储');
     return new Store(new UpstashDriver(upstashUrl, upstashToken), Number(process.env.STATE_CACHE_MS || 20000));
   }
-  if (process.env.STORE_DRIVER === 'blobs') {
+  const wantsBlobs = process.env.STORE_DRIVER === 'blobs';
+  const forbidsBlobs = process.env.STORE_DRIVER === 'file';
+  if (wantsBlobs || (!forbidsBlobs && hasNetlifyBlobs())) {
     console.log('[store] 使用 Netlify Blobs 存储');
     return new Store(new BlobsDriver(), 0);
   }
