@@ -633,22 +633,36 @@ async function readJSON(file) {
 
 class FileDriver {
   constructor(dir) {
+    this.kind = 'file';
     this.dir = dir;
     this.file = path.join(dir, 'state.json');
+    this.memory = null; // 写入失败后退化成内存，至少页面还能用
   }
   async load() {
+    if (this.memory) return this.memory;
     return readJSON(this.file);
   }
   async save(state) {
-    await fs.promises.mkdir(this.dir, { recursive: true });
-    const tmp = `${this.file}.${process.pid}.tmp`;
-    await fs.promises.writeFile(tmp, JSON.stringify(state), 'utf8');
-    await fs.promises.rename(tmp, this.file);
+    if (this.memory) {
+      this.memory = state;
+      return;
+    }
+    try {
+      await fs.promises.mkdir(this.dir, { recursive: true });
+      const tmp = `${this.file}.${process.pid}.tmp`;
+      await fs.promises.writeFile(tmp, JSON.stringify(state), 'utf8');
+      await fs.promises.rename(tmp, this.file);
+    } catch (err) {
+      console.warn(`[store] 写不进磁盘（${err.code || err.message}），本次运行改用内存存储`);
+      this.degraded = true;
+      this.memory = state;
+    }
   }
 }
 
 class UpstashDriver {
   constructor(url, token) {
+    this.kind = 'upstash';
     this.url = url.replace(/\/+$/, '');
     this.token = token;
   }
@@ -702,6 +716,15 @@ class Store {
   }
 
   /** 读-改-写，串行执行 */
+  get kind() {
+    return (this.driver && this.driver.kind) || 'unknown';
+  }
+
+  /** 存储自检信息：degraded 为 true 说明持久化失败，正在用内存顶着 */
+  info() {
+    return { kind: this.kind, degraded: !!(this.driver && this.driver.degraded) };
+  }
+
   update(mutator) {
     const run = async () => {
       const state = await this.get();
@@ -727,6 +750,7 @@ class Store {
  */
 class BlobsDriver {
   constructor() {
+    this.kind = 'blobs';
     this.storeName = 'songbox';
     this.cache = null;
     this.store = null;
@@ -771,23 +795,49 @@ function hasNetlifyBlobs() {
     require.resolve('@netlify/blobs');
     return true;
   } catch (err) {
+    /* 继续用下面的信号判断 */
+  }
+  try {
+    require('@netlify/blobs');
+    return true;
+  } catch (err) {
     return false;
   }
 }
 
-function createStore() {
+/** 判断该用哪种存储 */
+function pickDriver() {
   const upstashUrl = process.env.UPSTASH_REDIS_REST_URL;
   const upstashToken = process.env.UPSTASH_REDIS_REST_TOKEN;
-  if (upstashUrl && upstashToken) {
+  if (upstashUrl && upstashToken) return 'upstash';
+
+  const explicit = process.env.STORE_DRIVER;
+  if (explicit === 'file') return 'file';
+  if (explicit === 'blobs') return 'blobs';
+
+  // Netlify 函数环境：有 Blobs 上下文，或者跑在 Lambda 沙箱里（磁盘不可写）
+  if (process.env.NETLIFY_BLOBS_CONTEXT) return 'blobs';
+  if (process.env.NETLIFY || process.env.LAMBDA_TASK_ROOT || process.env.AWS_LAMBDA_FUNCTION_NAME) return 'blobs';
+  if (hasNetlifyBlobs()) return 'blobs';
+  return 'file';
+}
+
+function createStore() {
+  const kind = pickDriver();
+
+  if (kind === 'upstash') {
     console.log('[store] 使用 Upstash Redis 云端存储');
-    return new Store(new UpstashDriver(upstashUrl, upstashToken), Number(process.env.STATE_CACHE_MS || 20000));
+    return new Store(
+      new UpstashDriver(process.env.UPSTASH_REDIS_REST_URL, process.env.UPSTASH_REDIS_REST_TOKEN),
+      Number(process.env.STATE_CACHE_MS || 20000)
+    );
   }
-  const wantsBlobs = process.env.STORE_DRIVER === 'blobs';
-  const forbidsBlobs = process.env.STORE_DRIVER === 'file';
-  if (wantsBlobs || (!forbidsBlobs && hasNetlifyBlobs())) {
+
+  if (kind === 'blobs') {
     console.log('[store] 使用 Netlify Blobs 存储');
     return new Store(new BlobsDriver(), 0);
   }
+
   const dir = process.env.DATA_DIR || path.join(__dirname, '..', 'data');
   console.log(`[store] 使用本地文件存储：${dir}`);
   return new Store(new FileDriver(dir), 0);
@@ -1196,6 +1246,20 @@ async function handle(req, res) {
     } catch (err) {
       return fail(res, 400, err.message || '二维码生成失败');
     }
+  }
+
+  // ---------- 自检：用的哪种存储、对外地址
+  if (method === 'GET' && pathname === '/api/health') {
+    const state = await store.get();
+    const info = store.info();
+    return sendJSON(res, 200, {
+      ok: true,
+      store: info.kind,
+      degraded: info.degraded,
+      items: state.items.length,
+      url: publicBaseUrl(req),
+      time: Date.now(),
+    });
   }
 
   // ---------- 公开列表
