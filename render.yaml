@@ -1,0 +1,23 @@
+# Render 一键部署配置（免费套餐即可）
+# 使用方式：把仓库连到 Render，选 Blueprint，Render 会读这个文件。
+services:
+  - type: web
+    name: song-box
+    runtime: node
+    plan: free
+    # 想让国内访问快一点，可以取消下面这行的注释（免费实例也支持新加坡节点）
+    # region: singapore
+    buildCommand: npm install --omit=dev
+    startCommand: node server.js
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_VERSION
+        value: 20.11.1
+      # 后台密钥，Render 自动生成随机值，之后在 Environment 里查看
+      - key: ADMIN_KEY
+        generateValue: true
+      # 不填也能跑，但数据存在临时磁盘上，实例休眠后会清空
+      - key: UPSTASH_REDIS_REST_URL
+        sync: false
+      - key: UPSTASH_REDIS_REST_TOKEN
+        sync: false

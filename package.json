@@ -1,0 +1,16 @@
+{
+  "name": "song-box",
+  "version": "1.0.0",
+  "private": true,
+  "description": "晨读歌单：微信扫码匿名点歌 + 点赞排行 + 大屏榜单，零依赖 Node 服务",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node tools/qr-selftest.js && node tools/api-selftest.js && node tools/dom-smoke.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}

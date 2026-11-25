@@ -1,0 +1,7 @@
+node_modules/
+data/
+.env
+*.tmp
+tmp-matrix.txt
+qr-preview.png
+.DS_Store
